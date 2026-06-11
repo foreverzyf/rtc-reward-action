@@ -1,0 +1,146 @@
+name: 'RTC Reward Action'
+description: 'Automatically award RTC tokens to contributors when their PR is merged. Compatible with any open-source project using RustChain.'
+author: 'foreverzyf'
+branding:
+  icon: 'award'
+  color: 'green'
+
+inputs:
+  node-url:
+    description: 'RustChain node URL (default: https://rustchain.org)'
+    required: false
+    default: 'https://rustchain.org'
+  amount:
+    description: 'RTC amount to award per merged PR (default: 5)'
+    required: false
+    default: '5'
+  wallet-from:
+    description: 'Source wallet for the reward payment'
+    required: true
+  admin-key:
+    description: 'RTC admin key for signing transactions (store in secrets)'
+    required: true
+  dry-run:
+    description: 'If true, simulate the payment without executing it (default: false)'
+    required: false
+    default: 'false'
+  wallet-file:
+    description: 'Path to .rtc-wallet file in repo root (default: .rtc-wallet)'
+    required: false
+    default: '.rtc-wallet'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Read contributor wallet
+      id: read-wallet
+      shell: bash
+      run: |
+        # Try PR body first
+        PR_BODY="${{ github.event.pull_request.body }}"
+        WALLET=$(echo "$PR_BODY" | grep -oP 'rtc-wallet:\s*\K\S+' || true)
+        
+        # Fallback to .rtc-wallet file
+        if [ -z "$WALLET" ] && [ -f "${{ inputs.wallet-file }}" ]; then
+          WALLET=$(cat "${{ inputs.wallet-file }}" | head -1 | tr -d '[:space:]')
+        fi
+        
+        # Fallback to PR author username
+        if [ -z "$WALLET" ]; then
+          WALLET="${{ github.event.pull_request.user.login }}"
+          echo "No wallet found in PR body or .rtc-wallet file. Using GitHub username as wallet: $WALLET"
+        fi
+        
+        echo "wallet=$WALLET" >> $GITHUB_OUTPUT
+        echo "Contributor wallet resolved: $WALLET"
+
+    - name: Verify RTC node connectivity
+      id: verify-node
+      shell: bash
+      run: |
+        NODE_URL="${{ inputs.node-url }}"
+        echo "Checking RustChain node at $NODE_URL..."
+        HEALTH=$(curl -sk "$NODE_URL/health" 2>/dev/null || echo '{"ok":false}')
+        if echo "$HEALTH" | grep -q '"ok": true'; then
+          echo "Node is online."
+        else
+          echo "WARNING: Node appears offline or unreachable. Proceeding anyway (best-effort mode)."
+        fi
+
+    - name: Award RTC (or simulate)
+      id: award
+      shell: bash
+      run: |
+        WALLET="${{ steps.read-wallet.outputs.wallet }}"
+        AMOUNT="${{ inputs.amount }}"
+        FROM="${{ inputs.wallet-from }}"
+        NODE="${{ inputs.node-url }}"
+        DRY_RUN="${{ inputs.dry-run }}"
+        
+        echo "=========================================="
+        echo "RTC Reward Action"
+        echo "=========================================="
+        echo "Contributor: $WALLET"
+        echo "Amount: $AMOUNT RTC"
+        echo "Source: $FROM"
+        echo "Node: $NODE"
+        echo "Dry-run: $DRY_RUN"
+        echo "=========================================="
+        
+        if [ "$DRY_RUN" = "true" ]; then
+          echo "[DRY-RUN] Would transfer $AMOUNT RTC from $FROM to $WALLET"
+          echo "tx_hash=dry-run-simulated" >> $GITHUB_OUTPUT
+          echo "status=simulated" >> $GITHUB_OUTPUT
+        else
+          # Real transfer via RustChain API
+          echo "Submitting transfer..."
+          RESPONSE=$(curl -sk -X POST "$NODE/wallet/transfer" \
+            -H "Content-Type: application/json" \
+            -d "{\"from\":\"$FROM\",\"to\":\"$WALLET\",\"amount\":$AMOUNT,\"key\":\"${{ inputs.admin-key }}\"}" 2>/dev/null || echo '{"error":"network"}')
+          
+          if echo "$RESPONSE" | grep -q '"tx_hash"'; then
+            TX_HASH=$(echo "$RESPONSE" | grep -oP '"tx_hash"\s*:\s*"\K[^"]+')
+            echo "Transfer successful. TX: $TX_HASH"
+            echo "tx_hash=$TX_HASH" >> $GITHUB_OUTPUT
+            echo "status=success" >> $GITHUB_OUTPUT
+          else
+            echo "Transfer may have failed or is async. Response: $RESPONSE"
+            echo "tx_hash=unknown" >> $GITHUB_OUTPUT
+            echo "status=unknown" >> $GITHUB_OUTPUT
+          fi
+        fi
+
+    - name: Post confirmation comment
+      if: always()
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const wallet = '${{ steps.read-wallet.outputs.wallet }}';
+          const amount = '${{ inputs.amount }}';
+          const status = '${{ steps.award.outputs.status }}';
+          const txHash = '${{ steps.award.outputs.tx_hash }}';
+          const dryRun = '${{ inputs.dry-run }}' === 'true';
+          const prNumber = context.issue.number;
+          
+          let body = `## 🏆 RTC Reward ${dryRun ? '(Simulated)' : ''}\n\n`;
+          body += `**Contributor:** @${context.payload.pull_request.user.login}\n`;
+          body += `**Wallet:** \`${wallet}\`\n`;
+          body += `**Amount:** ${amount} RTC\n`;
+          body += `**Status:** ${status}\n`;
+          
+          if (txHash && txHash !== 'unknown') {
+            body += `**TX Hash:** \`${txHash}\`\n`;
+          }
+          
+          if (dryRun) {
+            body += `\n> ⚠️ This was a **dry-run**. No actual RTC was transferred. Remove \`dry-run: true\` to enable live payments.\n`;
+          }
+          
+          body += `\n---\n*Powered by [RTC Reward Action](https://github.com/marketplace/actions/rtc-reward-action)*`;
+          
+          github.rest.issues.createComment({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: prNumber,
+            body: body
+          });

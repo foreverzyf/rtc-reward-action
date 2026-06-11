@@ -1,0 +1,28 @@
+name: RTC Reward on PR Merge
+
+# Flat reward for light/simple contributions (stars, docs, small repo bounties).
+# Uses the reusable foreverzyf/rtc-reward-action — works with any RustChain-compatible project.
+# Best-effort: never gates CI.
+
+on:
+  pull_request_target:
+    types: [closed]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  reward:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Award RTC to contributor
+        continue-on-error: true
+        uses: foreverzyf/rtc-reward-action@v1
+        with:
+          node-url: https://rustchain.org
+          amount: 5
+          wallet-from: founder_community
+          admin-key: ${{ secrets.RTC_ADMIN_KEY }}
